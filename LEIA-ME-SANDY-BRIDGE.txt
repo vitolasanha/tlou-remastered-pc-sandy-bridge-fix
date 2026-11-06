@@ -1,38 +1,41 @@
-THE LAST OF US REMASTERED (PC) - SUPORTE A SANDY BRIDGE 
-========================================================
-O QUE ERA O PROBLEMA
-O jogo foi feito para o processador do PS4 (Jaguar), que tem quatro conjuntos de instruções que o
-Sandy Bridge não tem: BMI1, LZCNT, MOVBE e F16C. O port roda o código do jogo direto na CPU, então
-essas instruções davam "instrução ilegal" (ou, pior, TZCNT/LZCNT rodavam como BSF/BSR e davam
-resultado errado sem avisar).
+# THE LAST OF US REMASTERED (PC) – SUPORTE A SANDY BRIDGE
+=========================================================
 
-O QUE FOI FEITO (tudo em Python, nada para compilar)
-- gow3_pc/scripts/isa_emulation.py  substitui cada uma dessas instruções por um trecho de código que
-  usa só instruções que o Sandy Bridge tem (AVX1/SSE/x86-64 básico), com o mesmo resultado, as mesmas
-  flags e sem mexer na "red zone" da pilha.
-- gow3_pc/scripts/red_zone.py / red_zone_table.py  localizam essas instruções no executável do jogo
-  e geram a tabela que o runtime já sabe aplicar (red-zone.bin). O .exe do runtime NÃO muda.
-- gow3_pc/scripts/cpu_features.py  detecta o que a CPU não tem (so liga a emulação quando precisa;
-  numa CPU nova nada muda).
-- tools/probe_tlou.py  gera a tabela e desliga a trava "CPU não suportada" do runtime.
+## O PROBLEMA ORIGINAL
 
-COMO USAR (sem compilar nada)
-O runtime (gow3-probe.exe) já vem compilado no ZIP DE RELEASE do projeto (página "Releases" do
-repositório de onde você baixou o código), junto com o Python e o iced_x86. Por isso:
+O jogo foi desenvolvido para a CPU Jaguar do PS4, que suporta quatro conjuntos de instruções que os processadores Sandy Bridge não possuem: BMI1, LZCNT, MOVBE e F16C.
 
- 1. Baixe o ZIP DE RELEASE (TLOU-Remastered-windows.zip) e extraia numa pasta sem acentos.
- 2. Extraia o ZIP "overlay" (tlou-sandybridge-overlay.zip) POR CIMA dessa pasta, aceitando substituir
-    os arquivos. Ele troca/adiciona estes arquivos:
-        gow3_pc\scripts\isa_emulation.py, cpu_features.py, red_zone.py, red_zone_table.py
-        tools\probe_tlou.py
-        Iniciar-Launcher.cmd, Iniciar-Jogo.cmd, Diagnostico-CPU.cmd
- 3. (Opcional) Abra Diagnostico-CPU.cmd. No seu Xeon E5-2689 deve aparecer algo como:
-        Emulated:  BMI1, LZCNT, MOVBE, F16C        Blocking: nothing
- 4. Abra "TLOU Launcher.exe" (ou Iniciar-Launcher.cmd, que faz o mesmo sem o .exe), escolha a pasta
-    do jogo em "Pastas" e clique em JOGAR.
- 5. A PRIMEIRA execução gera a tabela e demora alguns minutos a mais (o Python analisa o executável
-    inteiro). As seguintes reaproveitam a tabela (só refaz se o jogo/update mudar).
+O port executa diretamente o código do jogo na CPU do computador. Por isso, a ausência dessas instruções causava erros de instrução ilegal (*Illegal Instruction*). Pior ainda, algumas instruções (como TZCNT/LZCNT) podiam ser executadas como BSF/BSR, produzindo resultados incorretos silenciosamente.
 
-Variável opcional TLOU_ISA_REWRITE: auto (padrão), force (emula tudo, mesmo em CPU boa, para testar),
-off (desliga).
+## O QUE FOI FEITO
 
+- `gow3_pc/scripts/isa_emulation.py` – Substitui cada instrução não suportada por uma sequência equivalente, utilizando apenas instruções compatíveis com Sandy Bridge (AVX1/SSE/x86-64 básico), preservando os mesmos resultados e flags, sem modificar a *red zone* da pilha.
+- `gow3_pc/scripts/red_zone.py` / `red_zone_table.py` – Localizam essas instruções no executável do jogo e geram a tabela de substituição que o runtime já sabe aplicar (`red-zone.bin`). O próprio executável do runtime (`.exe`) permanece inalterado.
+- `gow3_pc/scripts/cpu_features.py` – Detecta quais recursos da CPU estão ausentes e ativa a emulação somente quando necessário. Processadores mais recentes não são afetados.
+- `tools/probe_tlou.py` – Gera a tabela de substituição das instruções e desativa a verificação de CPU não suportada do runtime.
+
+## COMO USAR
+
+Para instalar a correção, basta copiar as pastas `gow3_pc` e `tools` do arquivo ZIP de sobreposição (*overlay*) e colá-las na pasta que contém a versão mais recente do projeto, permitindo a substituição dos arquivos quando solicitado.
+
+O runtime (`gow3-probe.exe`) já está compilado e incluído no ZIP de lançamento do projeto, juntamente com o Python e o `iced_x86`.
+
+1. Baixe o arquivo ZIP da versão mais recente e extraia seu conteúdo para uma pasta cujo caminho não contenha caracteres acentuados.
+2. Copie as pastas `gow3_pc` e `tools` do ZIP de sobreposição e cole-as na pasta da versão extraída, substituindo os arquivos existentes quando solicitado.
+3. (Opcional) Execute `Diagnostico-CPU.cmd`. No seu processador, o resultado deverá ser semelhante a este:
+
+   ```yaml
+   Emulated:  BMI1, LZCNT, MOVBE, F16C
+   Blocking: nothing
+   ```
+
+4. Abra `TLOU Launcher.exe`, selecione o jogo e clique em **PLAY**.
+5. Na primeira inicialização, será gerada a tabela de substituição das instruções. Esse processo pode levar alguns minutos extras enquanto o Python analisa o executável do jogo. Nas inicializações seguintes, a tabela gerada será reutilizada e só será criada novamente caso o jogo ou sua atualização sejam alterados.
+
+## VARIÁVEL DE AMBIENTE OPCIONAL
+
+A variável `TLOU_ISA_REWRITE` aceita três valores:
+
+- `auto` (padrão): Ativa automaticamente a emulação quando necessário.
+- `force`: Emula todas as instruções suportadas, mesmo em processadores mais recentes, para fins de teste.
+- `off`: Desativa a emulação de instruções.
