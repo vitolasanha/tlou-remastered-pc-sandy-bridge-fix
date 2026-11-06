@@ -40,6 +40,9 @@ from pathlib import Path
 import struct
 import zlib
 
+import bisect
+import isa_emulation
+
 try:
     import iced_x86
     from iced_x86 import (BlockEncoder, Code, Decoder, FlowControl, Instruction, InstructionInfoFactory,
@@ -213,7 +216,13 @@ class Op:
     flow: int = 0
     target: int = 0           # direct branch target, 0 if none
     successors: tuple = ()
+    isa: object = None        # isa_emulation.Site: replaced by emulation code in its stub
 
+
+# Instructions the ISA emulation (isa_emulation.py) can replace; see analyze(isa_kinds=...).
+_ISA_NAMES = ('TZCNT', 'LZCNT', 'MOVBE', 'ANDN', 'BEXTR', 'BLSI', 'BLSMSK', 'BLSR', 'VCVTPH2PS', 'VCVTPS2PH')
+ISA_MNEMONICS = frozenset() if iced_x86 is None else frozenset(
+    getattr(Mnemonic, name) for name in _ISA_NAMES if hasattr(Mnemonic, name))
 
 TERMINATORS = None if iced_x86 is None else (FlowControl.UNCONDITIONAL_BRANCH, FlowControl.INDIRECT_BRANCH,
                                              FlowControl.RETURN, FlowControl.INTERRUPT, FlowControl.EXCEPTION)
@@ -518,23 +527,37 @@ class Builder:
         self.groups = []        # (site, stub offset, stub bytes, protected, [(offset, original, new)])
 
     def stub(self, ops, protect, continuation):
-        """Encodes ops (Op list) for the next free address; returns (offset, bytes) or None."""
+        """Encodes ops (Op list) for the next free address; returns (offset, bytes) or None.
+        An op with `isa` set is replaced by its emulation code (isa_emulation.emulate), which
+        carries its own stack frame; the other ops are re-encoded by iced in runs between them."""
         at = self.code_offset + len(self.code)
-        instructions = []
-        for op in ops:
-            if op.ip in protect:
-                instructions.append(_lea(-RED_ZONE))
-            instructions.append(op.ins)
-            if op.ip in protect:
-                instructions.append(_lea(RED_ZONE))
-        if not ops or ops[-1].flow not in TERMINATORS:
-            instructions.append(Instruction.create_branch(Code.JMP_REL32_64, continuation))
-        encoder = BlockEncoder(64)
-        encoder.add_many(instructions)
+        out = bytearray()
+        pending = []
+
+        def flush():
+            if pending:
+                encoder = BlockEncoder(64)
+                encoder.add_many(pending)
+                out.extend(encoder.encode(at + len(out)))
+                pending.clear()
+
         try:
-            data = encoder.encode(at)
-        except ValueError:
+            for op in ops:
+                if op.isa is not None:
+                    flush()
+                    out.extend(isa_emulation.emulate(op.isa, at + len(out)))
+                    continue
+                if op.ip in protect:
+                    pending.append(_lea(-RED_ZONE))
+                pending.append(op.ins)
+                if op.ip in protect:
+                    pending.append(_lea(RED_ZONE))
+            if not ops or ops[-1].flow not in TERMINATORS:
+                pending.append(Instruction.create_branch(Code.JMP_REL32_64, continuation))
+            flush()
+        except (ValueError, isa_emulation.Unsupported):
             return None
+        data = bytes(out)
         start = len(self.code)
         self.code += data
         self.code += b'\xcc' * (-len(self.code) % 16)
@@ -553,6 +576,11 @@ def plan_function(f, builder, isa_bytes, used, padding, stats):
     image = builder.image
     sites = []
     for op in sorted(f.ops.values(), key=lambda o: o.ip):
+        if op.isa is not None:
+            sites.append(op)                    # emulated whatever the red zone holds (own frame)
+            continue
+        if builder.isa_only:
+            continue
         if not op.faultable or not (op.live & RZ_MASK):
             continue
         stats['candidates'] += 1
@@ -735,11 +763,17 @@ def padding_slots(image, functions):
     return slots
 
 
-def analyze(image, segments, code_offset, isa_bytes=frozenset(), functions=None):
+def analyze(image, segments, code_offset, isa_bytes=frozenset(), functions=None, isa_kinds=frozenset(), isa_only=False):
     """Groups and stub code protecting the red zone of every function of the linked image
-    (functions: (start, end) list, by default from the image's .eh_frame_hdr tables)."""
+    (functions: (start, end) list, by default from the image's .eh_frame_hdr tables).
+
+    isa_kinds: kinds of instruction (isa_emulation.Site.kind) that the host CPU lacks. Every such
+    instruction the analysis finds is replaced by emulation code in a stub, like a red-zone site;
+    builder.isa reports what was found and what could not be placed."""
     if iced_x86 is None:
         raise RuntimeError('iced_x86 is not installed')
+    if isa_kinds and len(ISA_MNEMONICS) < len(_ISA_NAMES):
+        raise RuntimeError('this iced_x86 version does not know all the instructions to replace')
     stats = dict.fromkeys(STATS_FIELDS, 0)
     functions = find_functions(image, segments) if functions is None else sorted(functions)
     stats['functions'] = len(functions)
@@ -747,35 +781,96 @@ def analyze(image, segments, code_offset, isa_bytes=frozenset(), functions=None)
         raise ValueError('no .eh_frame_hdr function table in the image')
     factory = InstructionInfoFactory()
     builder = Builder(image, code_offset)
+    builder.isa_only = isa_only                     # leave the red zone alone, only emulate instructions
+    isa_info = builder.isa = dict(enabled=bool(isa_kinds), found=0, kinds={}, orphans=0, unsupported=[],
+                                  errors=0, unpatched=[], outside=[])
     padding = padding_slots(image, functions)
     used = set()
+    isa_ips = []
     for start, end in functions:
         # Cheap filter: only functions with an explicit [rsp - k] operand (not lea rsp) use the red zone.
         uses = False
+        isa_ins = []
         for ins in Decoder(64, image[start:end], ip=start):
-            if ins.memory_base == Register.RSP and ins.memory_displacement >= 1 << 63 \
+            if isa_kinds and ins.mnemonic in ISA_MNEMONICS:
+                isa_ins.append(ins)
+            if not uses and ins.memory_base == Register.RSP and ins.memory_displacement >= 1 << 63 \
                     and not (ins.mnemonic == Mnemonic.LEA and ins.op0_register == Register.RSP):
                 uses = True
-                break
-        if not uses:
+                if not isa_kinds:
+                    break
+        sites = []
+        for ins in isa_ins:
+            site = isa_emulation.parse(image[ins.ip:ins.next_ip], ins.ip)
+            if site is None:
+                isa_info['unsupported'].append(ins.ip)
+            elif site.kind in isa_kinds:
+                sites.append((ins, site))
+        if (not uses or isa_only) and not sites:
             continue
-        f = decode_function(image, start, end, factory)
-        if not f.uses_red_zone:
-            continue
-        stats['red_zone_functions'] += 1
-        stats['conservative_functions'] += f.conservative
-        liveness(f)
-        plan_function(f, builder, isa_bytes, used, padding, stats)
+        try:
+            f = decode_function(image, start, end, factory)
+            if (not f.uses_red_zone or isa_only) and not sites:
+                continue
+            if f.uses_red_zone and not isa_only:
+                stats['red_zone_functions'] += 1
+                stats['conservative_functions'] += f.conservative
+                liveness(f)
+            for ins, site in sites:
+                op = f.ops.get(ins.ip)
+                if op is None:                      # not reached by the control-flow walk
+                    op = f.ops[ins.ip] = describe(ins, factory)
+                    isa_info['orphans'] += 1
+                op.isa = site
+                isa_ips.append(ins.ip)
+                isa_info['found'] += 1
+                isa_info['kinds'][site.kind] = isa_info['kinds'].get(site.kind, 0) + 1
+            plan_function(f, builder, isa_bytes, used, padding, stats)
+        except Exception:                           # a function the analysis cannot handle is left alone
+            if not sites:
+                raise
+            isa_info['errors'] += 1
     stats['groups'] = len(builder.groups)
+    if isa_kinds:
+        _isa_coverage(builder, isa_ips, isa_kinds, image, segments, functions, isa_info)
     return builder, stats
 
 
-def source_crc():
+def _isa_coverage(builder, isa_ips, isa_kinds, image, segments, functions, info):
+    """Which instructions found are inside a patch, and how many sit outside every known function."""
+    ranges = sorted((offset, offset + len(original)) for group in builder.groups
+                    for offset, original, new in group[4])
+    starts = [r[0] for r in ranges]
+    for ip in sorted(set(isa_ips)):
+        i = bisect.bisect_right(starts, ip) - 1
+        if i < 0 or not ranges[i][0] <= ip < ranges[i][1]:
+            info['unpatched'].append(ip)
+    # code between functions (assembly without unwind data, PLT stubs): counted, not patched
+    covered = sorted(functions)
+    for a, size, flags in segments:
+        if not flags & 1:
+            continue
+        pos = a
+        for s0, e0 in covered + [(a + size, a + size)]:
+            if e0 <= pos or s0 >= a + size:
+                continue
+            if s0 > pos and set(image[pos:s0]) - {0x90, 0xcc, 0x00}:
+                for ins in Decoder(64, image[pos:s0], ip=pos):
+                    if ins.mnemonic in ISA_MNEMONICS:
+                        site = isa_emulation.parse(image[ins.ip:ins.next_ip], ins.ip)
+                        if site is not None and site.kind in isa_kinds:
+                            info['outside'].append(ins.ip)
+            pos = max(pos, e0)
+
+
+def source_crc(isa_kinds=frozenset()):
+    """Cache key of a table: these scripts and the instruction kinds that it emulates."""
     here = Path(__file__).resolve().parent
-    return zlib.crc32(b''.join((here / name).read_bytes() for name in ('red_zone.py', 'red_zone_table.py')))
+    names = ('red_zone.py', 'red_zone_table.py', 'isa_emulation.py')
+    return zlib.crc32(b''.join((here / name).read_bytes() for name in names) + ','.join(sorted(isa_kinds)).encode())
 
 
-def encode_section(builder, stats):
+def encode_section(builder, stats, isa_kinds=frozenset()):
     groups = bytearray()
     for site, stub_at, stub_len, protected, patches in builder.groups:
         groups += GROUP.pack(site, stub_at, stub_len, protected, len(patches))
@@ -783,7 +878,7 @@ def encode_section(builder, stats):
             assert len(original) == len(new)
             groups += PATCH.pack(offset, len(original)) + original + new
     code = bytes(builder.code)
-    return (SECTION.pack(MAGIC, builder.code_offset, len(code), len(builder.groups), len(groups), VERSION, source_crc())
+    return (SECTION.pack(MAGIC, builder.code_offset, len(code), len(builder.groups), len(groups), VERSION, source_crc(isa_kinds))
             + STATS.pack(*(stats[k] for k in STATS_FIELDS)) + code + bytes(groups))
 
 
@@ -794,6 +889,20 @@ def summary(stats):
             f"{stats['candidates']} candidates ({stats['skipped_isa']} also ISA-rewrite sites), not protected: "
             f"{stats['skipped_stack']} use rsp, {stats['skipped_control']} control flow, "
             f"{stats['skipped_unrelocatable']} unrelocatable")
+
+
+def isa_summary(builder):
+    info = getattr(builder, 'isa', None)
+    if not info or not info['enabled']:
+        return ''
+    kinds = ', '.join(f'{k} {n}' for k, n in sorted(info['kinds'].items()))
+    line = (f"ISA emulation: {info['found']} instructions replaced ({kinds}); "
+            f"{len(info['unpatched'])} not placed, {len(info['outside'])} outside any function, "
+            f"{len(info['unsupported'])} unsupported forms, {info['errors']} functions failed")
+    for label in ('unpatched', 'outside', 'unsupported'):
+        if info[label]:
+            line += f"\n  {label}: " + ' '.join(f'{ip:#x}' for ip in info[label][:12]) + (' ...' if len(info[label]) > 12 else '')
+    return line
 
 
 def code_offset_for(image_size, site_count):
