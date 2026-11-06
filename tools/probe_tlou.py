@@ -212,15 +212,39 @@ def main():
     scripts = ROOT / "gow3_pc/scripts"
     for script in ("prepare.py", "link_modules.py", "content_profile.py"):
         subprocess.run([sys.executable, str(scripts / script), str(view), "--out", str(out)], check=True)
+    # CPUs older than Haswell lack instructions the PS4 code uses (BMI1, LZCNT, MOVBE, F16C): they are
+    # replaced by emulation code in the same table as the red-zone protection (gow3_pc/scripts/
+    # isa_emulation.py). TLOU_ISA_REWRITE=auto (default) | force | off.
+    sys.path.insert(0, str(scripts))
+    import cpu_features
+    isa_mode = os.environ.get("TLOU_ISA_REWRITE", "auto").lower()
+    if isa_mode == "off":
+        isa_names = []
+    elif isa_mode == "force":
+        isa_names = list(cpu_features.FEATURE_KINDS)
+    else:
+        isa_names = cpu_features.missing_emulatable() or []
     # Windows red-zone protection (gow3_pc/scripts/red_zone.py): GOW3_RED_ZONE_REWRITE=0 turns it off.
     red_zone = None
-    if os.environ.get("GOW3_RED_ZONE_REWRITE") != "0":
-        table = subprocess.run([sys.executable, str(scripts / "red_zone_table.py"), str(out / "boot-linked.bin"),
-                                "--out", str(out)])
+    want_red_zone = os.environ.get("GOW3_RED_ZONE_REWRITE") != "0"
+    if want_red_zone or isa_names:
+        command = [sys.executable, str(scripts / "red_zone_table.py"), str(out / "boot-linked.bin"), "--out", str(out)]
+        if not want_red_zone:
+            command.append("--isa-only")
+        table = subprocess.run(command)
         if table.returncode == 0:
             red_zone = out / "red-zone.bin"
+        elif isa_names:
+            sys.exit("This CPU lacks " + ", ".join(isa_names) + ", which the game's code uses, and the table that "
+                     "replaces those instructions could not be made (see above; it needs the iced_x86 package that "
+                     "the release folder carries in gow3_pc/out/pydeps).")
+    isa_active = bool(isa_names) and red_zone is not None
+    if isa_active:
+        print("ISA emulation active for: " + ", ".join(isa_names))
 
     env = dict(os.environ)
+    if isa_active and not cpu_features.missing_blocking():
+        env["GOW3_CPU_CHECK"] = "0"           # the runtime would stop on the sets that are emulated now
     msys = Path(os.environ.get("MSYS2_ROOT", "C:/msys64"))
     env["PATH"] = str(msys / "clang64/bin") + os.pathsep + env.get("PATH", "")
     env["GOW3_GPU_USER_DIR"] = str(user)
